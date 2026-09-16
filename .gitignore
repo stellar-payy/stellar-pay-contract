@@ -1,0 +1,8 @@
+/target
+.stellar/
+*.wasm
+.env
+
+# soroban-sdk testutils auto-generated debug snapshots, regenerated on every
+# test run, not part of the contract's source of truth
+test_snapshots/
