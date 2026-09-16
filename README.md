@@ -30,6 +30,95 @@ outcomes.
   toolchains (this one pins `edition = "2021"` for `wasm32`/`stellar-cli`
   compatibility, unrelated to the backend's edition choice).
 
+## Architecture
+
+This contract has exactly one write path and it is always reached from the
+backend's reconciliation worker, never directly from a merchant or payer:
+
+```
+  stellar-pay-backend                         stellar-payy-contract (this repo)
+  --------------------                        ------------------------------
+  ReconciliationWorker
+    detects payment as Confirmed
+    via Horizon (authoritative)
+           |
+           v
+  OnChainRecorder::record_payment  ---Soroban RPC--->  PaymentRegistry::record_payment
+    (best-effort, logged on error)                       caller.require_auth()
+           |                                             caller == admin?  else Unauthorized
+           | (never blocks/rolls back                    payment_id already recorded?
+           |  the backend's own confirmation)                else AlreadyRecorded
+           v                                             write PaymentRecord, bump TTL
+  payment stays Confirmed                                 publish PAY_REC event
+  regardless of this call's outcome
+```
+
+Storage is two keyed spaces in the contract's persistent storage:
+
+```
+DataKey::Admin              -> Address                (instance storage, set once by init)
+DataKey::Payment(payment_id) -> PaymentRecord          (persistent storage, one entry per payment)
+```
+
+`record_payment`'s actual control flow, including the auth/admin split and
+the TTL bump on write:
+
+```rust
+pub fn record_payment(
+    env: Env,
+    caller: Address,
+    payment_id: BytesN<16>,
+    stellar_tx_hash: BytesN<32>,
+    amount: i128,
+    destination: Address,
+    reference: String,
+) -> Result<(), PaymentRegistryError> {
+    caller.require_auth();
+
+    let admin: Address = match env.storage().instance().get(&DataKey::Admin) {
+        Some(admin) => admin,
+        None => return Err(PaymentRegistryError::NotInitialized),
+    };
+
+    if caller != admin {
+        return Err(PaymentRegistryError::Unauthorized);
+    }
+
+    if amount <= 0 {
+        return Err(PaymentRegistryError::InvalidAmount);
+    }
+
+    let key = DataKey::Payment(payment_id.clone());
+    if env.storage().persistent().has(&key) {
+        return Err(PaymentRegistryError::AlreadyRecorded);
+    }
+
+    let record = PaymentRecord {
+        stellar_tx_hash,
+        amount,
+        destination,
+        reference,
+        recorded_at: env.ledger().timestamp(),
+    };
+
+    env.storage().persistent().set(&key, &record);
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, PAYMENT_LIFETIME_THRESHOLD, PAYMENT_BUMP_AMOUNT);
+
+    event::publish_payment_recorded(&env, payment_id, &record);
+    return Ok(());
+}
+```
+
+`caller.require_auth()` proves signature control over `caller`; whether that
+caller is actually the admin is a separate, catchable business rule
+(`Unauthorized`), never folded into the auth check itself. Payment records
+are bumped on a ~365 day TTL cycle (vs. ~30 days for the admin-holding
+contract instance) since they are the permanent audit trail this contract
+exists for; `bump_ttl` lets anyone renew a record indefinitely before it
+would otherwise become eligible for archival off the live ledger.
+
 ## Repository layout
 
 ```
